@@ -138,12 +138,40 @@ class EnergysoftClient:
 
         return None
 
+    def _get_odata_key(self, value: Any) -> str:
+        """Convertit une valeur en clé OData littérale compatible avec les tests et l'API."""
+        return f"'{str(value).strip()}'"
+
+    def _record_matches_hints(self, record: Dict[str, Any], hints: List[str]) -> bool:
+        """Vérifie si un enregistrement contient un des indices fournis dans ses champs clés."""
+        if not record or not hints:
+            return False
+
+        def normalize(value: Any) -> str:
+            text = str(value or "")
+            return "".join(ch for ch in text.lower() if ch.isalnum())
+
+        candidates: List[str] = []
+        for key in ["ID", "Id", "Name", "Reference"]:
+            if key in record:
+                candidates.append(str(record[key]))
+
+        site = record.get("Site") if isinstance(record.get("Site"), dict) else {}
+        for key in ["Name", "Id", "Reference", "ID"]:
+            if key in site:
+                candidates.append(str(site[key]))
+
+        normalized_candidates = [normalize(candidate) for candidate in candidates]
+        normalized_hints = [normalize(hint) for hint in hints]
+
+        return any(hint in candidate for hint in normalized_hints for candidate in normalized_candidates)
+
     def _format_odata_id(self, id_value: Any) -> str:
         """Formate correctement un identifiant pour une requête OData v4."""
         val_str = str(id_value).strip()
         if val_str.isdigit():
             return val_str
-        return f"'{val_str}'"
+        return self._get_odata_key(id_value)
 
     def get_sites(self, site_id: Optional[str] = None) -> Union[pd.DataFrame, Dict[str, Any]]:
         """Récupère un site spécifique ou la liste complète des sites."""

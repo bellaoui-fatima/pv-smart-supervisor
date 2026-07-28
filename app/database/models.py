@@ -45,20 +45,47 @@ class Inverter(Base):
 
 
 class DailyMeasure(Base):
-    """Modèle représentant les mesures journalières agrégées d'une centrale."""
+    """
+    Modèle représentant les mesures journalières agrégées d'une centrale, 
+    enrichies par la couche de Feature Engineering pour l'IA.
+    """
     __tablename__ = "daily_measures"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     plant_id = Column(Integer, ForeignKey("plants.id"), nullable=False)
     date = Column(DateTime, nullable=False, index=True)
+    
+    # --- Données Brutes (Raw Data issues de l'API) ---
     production = Column(Float, nullable=True)
     temperature = Column(Float, nullable=True)
     irradiation = Column(Float, nullable=True)
     budget_production = Column(Float, nullable=True)
     budget_irradiation = Column(Float, nullable=True)
     budget_temperature = Column(Float, nullable=True)
-    expected_production = Column(Float, nullable=True)
-    delta = Column(Float, nullable=True)
+    
+    # --- Features de Production ---
+    expected_production = Column(Float, nullable=True, comment="Production théorique attendue (kWh)")
+    delta = Column(Float, nullable=True, comment="Différence entre production réelle et attendue (kWh)")
+    performance_ratio = Column(Float, nullable=True, comment="Ratio de performance (Prod réelle / Prod attendue)")
+
+    # --- Features Météo ---
+    temperature_gap = Column(Float, nullable=True, comment="Écart de température par rapport à la référence")
+    irradiation_ratio = Column(Float, nullable=True, comment="Ratio d'irradiation (Réelle / Budget)")
+
+    # --- Features Pertes ---
+    loss_percentage = Column(Float, nullable=True, comment="Pourcentage de pertes déclarées")
+
+    # --- Features Équipements (Strings & Inverters) ---
+    offline_inverters = Column(Integer, nullable=True, comment="Nombre d'onduleurs hors ligne")
+    failed_strings = Column(Integer, nullable=True, comment="Nombre de chaînes (strings) défaillantes")
+    communication_status = Column(Boolean, nullable=True, comment="État global de la communication de la centrale")
+
+    # --- Features Temporelles ---
+    rolling_mean_7d = Column(Float, nullable=True, comment="Moyenne glissante de la production sur 7 jours")
+    rolling_std_7d = Column(Float, nullable=True, comment="Écart-type glissant de la production sur 7 jours")
+    
+    # --- Feature de Qualité / Métier ---
+    anomaly_score_rule = Column(Float, nullable=True, comment="Score d'anomalie calculé via règles expertes")
 
     # Relation
     plant = relationship("Plant", back_populates="daily_measures")

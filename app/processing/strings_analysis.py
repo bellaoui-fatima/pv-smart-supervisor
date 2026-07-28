@@ -1,211 +1,164 @@
-import os
+"""
+Module d'analyse des chaînes de panneaux photovoltaïques (Strings).
+Dédié au calcul de l'état de connexion, à la détection des chaînes défaillantes 
+et à la comparaison des rendements relatifs par onduleur.
+Ne contient aucun code d'affichage (Plotly) ni d'I/O (fichiers/API).
+"""
+
 import re
-from typing import Dict, Any, List, Tuple
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
 from app.utils.logger import logger
+
+
+@dataclass
+class StringAnalysisResult:
+    """
+    Structure de données contenant les résultats synthétiques de l'analyse des strings.
+    """
+    connected_strings: List[str] = field(default_factory=list)
+    disconnected_strings: List[str] = field(default_factory=list)
+    failed_strings: List[str] = field(default_factory=list)
+    active_strings_count: int = 0
+    weakest_string: Optional[str] = None
+    weakest_inverter: Optional[str] = None
+    average_ratio: float = 0.0
+    ratios: Dict[str, float] = field(default_factory=dict)
+
 
 class StringAnalyzer:
     """
-    Responsabilité unique : Analyse statistique avancée des courants des strings DC
-    et détection des déséquilibres ou déconnexions par onduleur.
-    Adapté pour traiter n'importe quelle centrale de manière dynamique.
+    Classe de traitement analytique sur les courants DC des chaînes (strings).
     """
 
-    THRESHOLD: float = 0.1
-    RATIO_LOW: float = 0.85
-    RATIO_HIGH: float = 1.15
-
-    @classmethod
-    def analyze_plant_strings(
-        cls, 
-        df_raw: pd.DataFrame, 
-        plant_id: str, 
-        output_plots_dir: str = "output/plots"
-    ) -> Dict[str, Any]:
+    def __init__(
+        self, 
+        current_threshold: float = 0.1, 
+        connection_ratio_threshold: float = 0.5,
+        failure_ratio_threshold: float = 0.85
+    ) -> None:
         """
-        Exécute l'analyse complète des strings pour une centrale donnée.
-        
         Args:
-            df_raw (pd.DataFrame): Données brutes de la centrale contenant les courants et l'irradiation.
-            plant_id (str): Identifiant unique de la centrale.
-            output_plots_dir (str): Répertoire cible pour la sauvegarde des rapports HTML Plotly.
-            
-        Returns:
-            Dict[str, Any]: Synthèse des anomalies détectées et métriques clés.
+            current_threshold (float): Seuil de courant minimal (en A) pour considérer un string actif.
+            connection_ratio_threshold (float): Pourcentage minimal de jours actifs pour être jugé 'connecté'.
+            failure_ratio_threshold (float): Ratio sous lequel une chaîne est considérée en sous-performance/défaillante.
         """
-        if df_raw.empty:
-            logger.warning(f" Aucun enregistrement fourni pour l'analyse des strings de la centrale {plant_id}.")
-            return {}
+        self.current_threshold = current_threshold
+        self.connection_ratio_threshold = connection_ratio_threshold
+        self.failure_ratio_threshold = failure_ratio_threshold
 
-        logger.info(f" Lancement de l'analyse des strings DC pour la centrale : {plant_id}")
-        
-        # Copie de travail pour éviter les effets de bord (SettingWithCopyWarning)
-        df = df_raw.copy()
-        
-        # 1. Standardisation de l'axe temporel
-        time_col = 'Timestamp' if 'Timestamp' in df.columns else ('date' if 'date' in df.columns else None)
-        if not time_col:
-            raise KeyError("La source de données doit contenir une colonne 'Timestamp' ou 'date'.")
-        
-        df[time_col] = pd.to_datetime(df[time_col])
-        df = df.sort_values(time_col).reset_index(drop=True)
+    def analyze(self, df: pd.DataFrame, irradiance_col: str = "irr") -> StringAnalysisResult:
+        """
+        Exécute l'analyse complète sur un DataFrame de mesures haute fréquence ou journalières.
 
-        # 2. Identification dynamique des colonnes de strings (I_DC) et d'irradiation
-        string_cols = [c for c in df.columns if 'I_DC' in c]
-        irr_col = 'irr' if 'irr' in df.columns else ('irradiation' if 'irradiation' in df.columns else None)
+        Args:
+            df (pd.DataFrame): DataFrame contenant les colonnes 'I_DC' et l'irradiation.
+            irradiance_col (str): Nom de la colonne d'irradiation.
 
+        Returns:
+            StringAnalysisResult: Dataclass structurée des résultats de l'analyse.
+        """
+        if df is None or df.empty:
+            logger.warning("StringAnalyzer: DataFrame d'entrée vide.")
+            return StringAnalysisResult()
+
+        logger.info("Début de l'analyse détaillée des strings...")
+
+        # Identification des colonnes de courant DC
+        string_cols = [c for c in df.columns if "I_DC" in c]
         if not string_cols:
-            logger.warning(f" Aucune colonne de type 'I_DC' détectée pour la centrale {plant_id}. Abandon.")
-            return {}
-        if not irr_col:
-            logger.warning(f" Colonne d'irradiation absente ou mal nommée pour {plant_id}. Calculs normalisés dégradés.")
+            logger.warning("StringAnalyzer: Aucune colonne de type 'I_DC' n'a été trouvée.")
+            return StringAnalysisResult()
 
-        # Typage numérique strict
-        df[string_cols] = df[string_cols].apply(pd.to_numeric, errors='coerce')
-        if irr_col:
-            df[irr_col] = pd.to_numeric(df[irr_col], errors='coerce')
+        # Nettoyage préalable des types
+        df_work = df.copy()
+        df_work[string_cols] = df_work[string_cols].apply(pd.to_numeric, errors="coerce")
 
-        # 3. Analyse de l'état de connexion des strings
-        # Un string est considéré connecté s'il produit (I > THRESHOLD) sur plus de 50% de la période
-        connected_strings = [c for c in string_cols if (df[c] > cls.THRESHOLD).mean() > 0.5]
-        disconnected_strings = [c for c in string_cols if c not in connected_strings]
-
-        # Calcul du nombre de strings actifs à chaque pas de temps
-        active_per_timestamp = (df[string_cols] > cls.THRESHOLD).sum(axis=1)
-
-        # 4. Extraction dynamique de la liste des onduleurs présents
-        inverters = sorted(set(cls._extract_inverter_id(c) for c in string_cols if cls._extract_inverter_id(c)))
-
-        # 5. Calcul des moyennes quotidiennes normalisées par onduleur
-        # Formule : $$mean\_inv(j) = \frac{1}{N} \sum_{i=1}^{N} \frac{I_i(j)}{irr(j)}$$
-        inv_daily_mean = {}
-        if irr_col:
-            irr_safe = df[irr_col].replace(0, np.nan) # Protection division par zéro
-            for inv in inverters:
-                cols_inv = [c for c in connected_strings if f'INV {inv} ' in c or f'INV{inv}_' in c or c.startswith(f'INV_{inv}')]
-                n = len(cols_inv)
-                if n > 0:
-                    inv_daily_mean[inv] = df[cols_inv].divide(irr_safe, axis=0).sum(axis=1) / n
-
-        # 6. Comparaison des courants de chaque string par rapport à la moyenne globale
-        df_active = df[connected_strings].copy()
-        df_active.index = df[time_col]
-        daily_mean_global = df_active.mean(axis=1)
+        # 1. Analyse de la connexion et activité
+        connected, disconnected = self._check_connections(df_work, string_cols)
         
-        # Sécurité anti-division par zéro si la moyenne globale est nulle (nuit)
-        safe_global_mean = daily_mean_global.replace(0, np.nan)
-        ratio_df = df_active.divide(safe_global_mean, axis=0)
+        # Nombre moyen de strings actifs par échantillon/jour
+        active_strings_series = (df_work[string_cols] > self.current_threshold).sum(axis=1)
+        avg_active_count = int(round(active_strings_series.mean())) if not active_strings_series.empty else 0
 
-        string_alerts = []
-        for col in connected_strings:
-            ratio_mean = ratio_df[col].mean()
-            if pd.isna(ratio_mean):
-                continue
-                
-            status = "OK"
-            if ratio_mean < cls.RATIO_LOW:
-                status = "FAIBLE"
-            elif ratio_mean > cls.RATIO_HIGH:
-                status = "ELEVE"
-                
-            if status != "OK":
-                string_alerts.append({
-                    "string_name": col,
-                    "short_name": cls._short_name(col),
-                    "ratio": round(ratio_mean, 3),
-                    "status": status
-                })
+        if not connected:
+            logger.warning("StringAnalyzer: Aucun string connecté détecté.")
+            return StringAnalysisResult(
+                disconnected_strings=disconnected,
+                failed_strings=disconnected,
+                active_strings_count=avg_active_count
+            )
 
-        # 7. Génération des rapports graphiques Plotly (HTML)
-        os.makedirs(output_plots_dir, exist_ok=True)
-        cls._generate_plots(
-            df=df,
-            time_col=time_col,
-            plant_id=plant_id,
-            string_cols=string_cols,
-            connected_strings=connected_strings,
-            active_per_timestamp=active_per_timestamp,
-            inverters=inverters,
-            inv_daily_mean=inv_daily_mean,
-            daily_mean_global=daily_mean_global,
-            ratio_df=ratio_df,
-            output_dir=output_plots_dir
+        # 2. Calcul du ratio de performance par rapport à la moyenne globale
+        df_active = df_work[connected].copy()
+        daily_mean_global = df_active.mean(axis=1).replace(0, np.nan)
+        ratio_df = df_active.divide(daily_mean_global, axis=0)
+
+        ratios: Dict[str, float] = {}
+        failed_strings: List[str] = list(disconnected)  # Les désactivés sont d'office considérés hors-service
+
+        for col in connected:
+            ratio_mean = float(ratio_df[col].mean())
+            if np.isnan(ratio_mean):
+                ratio_mean = 0.0
+            ratios[col] = round(ratio_mean, 3)
+
+            # Identification des sous-performances
+            if ratio_mean < self.failure_ratio_threshold:
+                failed_strings.append(col)
+
+        # 3. Identification des éléments les plus faibles
+        weakest_string = min(ratios, key=ratios.get) if ratios else None
+        average_ratio = float(np.mean(list(ratios.values()))) if ratios else 0.0
+
+        # 4. Identification de l'onduleur le plus faible
+        weakest_inverter = self._identify_weakest_inverter(connected, ratios)
+
+        logger.info(f"Analyse terminée: {len(connected)} connectés, {len(failed_strings)} défaillants.")
+
+        return StringAnalysisResult(
+            connected_strings=connected,
+            disconnected_strings=disconnected,
+            failed_strings=failed_strings,
+            active_strings_count=avg_active_count,
+            weakest_string=weakest_string,
+            weakest_inverter=weakest_inverter,
+            average_ratio=round(average_ratio, 3),
+            ratios=ratios
         )
 
-        # 8. Retour des indicateurs pour alimenter la brique diagnostic/incidents
-        return {
-            "plant_id": plant_id,
-            "total_strings_count": len(string_cols),
-            "connected_strings_count": len(connected_strings),
-            "disconnected_strings_count": len(disconnected_strings),
-            "disconnected_strings_list": disconnected_strings,
-            "anomalous_strings": string_alerts
+    def _check_connections(self, df: pd.DataFrame, string_cols: List[str]) -> tuple[List[str], List[str]]:
+        """Sépare les strings connectés des déconnectés selon leur activité historique."""
+        connected = [
+            c for c in string_cols 
+            if (df[c] > self.current_threshold).mean() > self.connection_ratio_threshold
+        ]
+        disconnected = [c for c in string_cols if c not in connected]
+        return connected, disconnected
+
+    def _identify_weakest_inverter(self, connected_strings: List[str], ratios: Dict[str, float]) -> Optional[str]:
+        """Agrège les ratios par onduleur pour identifier l'onduleur le moins performant."""
+        inverter_ratios: Dict[str, List[float]] = {}
+
+        for col in connected_strings:
+            # Extrait le nom de l'onduleur (ex: 'INV 1' depuis 'INV 1_DC1_1')
+            match = re.search(r'(INV\s*\d+)', col, re.IGNORECASE)
+            inv_name = match.group(1).upper() if match else "INV_UNKNOWN"
+
+            if inv_name not in inverter_ratios:
+                inverter_ratios[inv_name] = []
+            if col in ratios:
+                inverter_ratios[inv_name].append(ratios[col])
+
+        # Calcul du ratio moyen par onduleur
+        inv_means = {
+            inv: np.mean(val_list) 
+            for inv, val_list in inverter_ratios.items() if val_list
         }
 
-    @staticmethod
-    def _extract_inverter_id(col_name: str) -> str:
-        """Extrait l'identifiant numérique ou textuel de l'onduleur depuis le nom de colonne."""
-        match = re.search(r'INV\s*[-_]?\s*(\d+)', col_name, re.IGNORECASE)
-        return match.group(1) if match else ""
+        if not inv_means:
+            return None
 
-    @staticmethod
-    def _short_name(col: str) -> str:
-        """Génère un libellé court et lisible pour les graphiques Plotly."""
-        m = re.search(r'INV\s*(\d+).*I_DC(\d+_\d+|\d+)', col, re.IGNORECASE)
-        return f"INV{m.group(1)}_DC{m.group(2)}" if m else col
-
-    @classmethod
-    def _generate_plots(
-        cls, df: pd.DataFrame, time_col: str, plant_id: str, string_cols: List[str],
-        connected_strings: List[str], active_per_timestamp: pd.Series, inverters: List[str],
-        inv_daily_mean: Dict[str, pd.Series], daily_mean_global: pd.Series, ratio_df: pd.DataFrame,
-        output_dir: str
-    ) -> None:
-        """Centralise la génération et l'écriture des fichiers HTML interactifs."""
-        COLORS = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd','#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf']
-
-        # --- Graphique 1: Strings actifs par jour ---
-        fig1 = go.Figure()
-        fig1.add_trace(go.Bar(x=df[time_col], y=active_per_timestamp.values, name='Strings actifs', marker_color='steelblue'))
-        fig1.add_hline(y=len(connected_strings), line_dash='dash', line_color='green', annotation_text=f'Connectés ({len(connected_strings)})')
-        fig1.update_layout(title=f"Centrale {plant_id} - Nombre de strings actifs (I > {cls.THRESHOLD} A)", yaxis_title="Nb strings", xaxis_title="Date")
-        fig1.write_html(os.path.join(output_dir, f'{plant_id}_strings_actifs.html'))
-
-        # --- Graphique 2: Moyenne quotidienne normalisée par onduleur ---
-        if inv_daily_mean:
-            fig2 = make_subplots(rows=len(inverters), cols=1, shared_xaxes=True, subplot_titles=[f"INV {inv} – Moyenne normalisée" for inv in inverters])
-            for i, inv in enumerate(inverters, 1):
-                if inv in inv_daily_mean:
-                    fig2.add_trace(go.Scatter(x=df[time_col], y=inv_daily_mean[inv], mode='lines', name=f'INV {inv}'), row=i, col=1)
-            fig2.update_layout(title=f"Centrale {plant_id} - Moyenne quotidienne normalisée (I / irr)", height=250 * len(inverters))
-            fig2.write_html(os.path.join(output_dir, f'{plant_id}_moyenne_onduleurs.html'))
-
-        # --- Graphique 3 & 4: Profils et Ratios individuels par Onduleur ---
-        for inv in inverters:
-            cols_inv = [c for c in connected_strings if f'INV {inv} ' in c or f'INV{inv}_' in c or c.startswith(f'INV_{inv}')]
-            if not cols_inv:
-                continue
-
-            # Profils de courants
-            fig_p = go.Figure()
-            for j, col in enumerate(cols_inv):
-                fig_p.add_trace(go.Scatter(x=df[time_col], y=df[col], mode='lines', name=cls._short_name(col), line=dict(color=COLORS[j % len(COLORS)], width=1.5)))
-            fig_p.add_trace(go.Scatter(x=df[time_col], y=daily_mean_global.values, mode='lines', name='Moyenne globale', line=dict(color='black', width=2, dash='dash')))
-            fig_p.update_layout(title=f"Centrale {plant_id} - Courants strings Onduleur {inv}", yaxis_title="Courant DC (A)", xaxis_title="Date")
-            fig_p.write_html(os.path.join(output_dir, f'{plant_id}_profil_INV{inv}.html'))
-
-            # Ratios d'écarts
-            fig_r = go.Figure()
-            for j, col in enumerate(cols_inv):
-                if col in ratio_df.columns:
-                    fig_r.add_trace(go.Scatter(x=df[time_col], y=ratio_df[col], mode='lines', name=cls._short_name(col), line=dict(color=COLORS[j % len(COLORS)], width=1.5)))
-            fig_r.add_hline(y=1.0, line_dash='dash', line_color='black', annotation_text='Référence')
-            fig_r.add_hline(y=cls.RATIO_LOW, line_dash='dot', line_color='red', annotation_text=f'-{int((1-cls.RATIO_LOW)*100)}%')
-            fig_r.add_hline(y=cls.RATIO_HIGH, line_dash='dot', line_color='orange', annotation_text=f'+{int((cls.RATIO_HIGH-1)*100)}%')
-            fig_r.update_layout(title=f"Centrale {plant_id} - Ratios d'écart Onduleur {inv}", yaxis_title="Ratio", xaxis_title="Date")
-            fig_r.write_html(os.path.join(output_dir, f'{plant_id}_ratio_INV{inv}.html'))
-            
-        logger.info(f" Fichiers HTML d'analyse visuelle générés avec succès dans '{output_dir}'.")
+        return min(inv_means, key=inv_means.get)
