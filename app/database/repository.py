@@ -4,8 +4,9 @@ Centralise toutes les opérations de persistance et de récupération des donné
 pour isoler la logique métier des appels SQL directs (pattern Repository).
 """
 
-from typing import List, Optional, Type, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from datetime import datetime, date
+import json
 import pandas as pd
 from sqlalchemy.orm import Session
 from app.database.models import Plant, Inverter, DailyMeasure, Loss, Incident, Alert
@@ -54,10 +55,12 @@ class DatabaseRepository:
                     return None
         return value
 
+    # =========================================================================
+    # --- Gestion des Features et Mesures ---
+    # =========================================================================
+
     def save_features(self, plant_id: int, features_data: List[dict]) -> None:
-        """
-        Enregistre ou met à jour les features et mesures agrégées pour une centrale.
-        """
+        """Enregistre ou met à jour les features et mesures agrégées pour une centrale."""
         feature_keys = [
             "production", "temperature", "irradiation", "budget_production", 
             "budget_irradiation", "budget_temperature", "expected_production", 
@@ -79,7 +82,6 @@ class DatabaseRepository:
             if existing:
                 for key in feature_keys:
                     if key in data and data[key] is not None:
-                        # Conversion NaN pandas -> None pour SQL
                         val = data[key]
                         if isinstance(val, float) and pd.isna(val):
                             val = None
@@ -140,7 +142,10 @@ class DatabaseRepository:
         else:
             logger.warning(f"Impossible de mettre à jour : aucune mesure trouvée au {target_date}.")
 
-    # --- Méthodes existantes conservées ---
+    # =========================================================================
+    # --- Gestion des Entités de Référence (Plants, Inverters, Losses) ---
+    # =========================================================================
+
     def save_plants(self, plants_data: List[dict]) -> None:
         for data in plants_data:
             raw_id = data.get("rawametrix_id") or data.get("id") or data.get("plant_id")
@@ -204,24 +209,158 @@ class DatabaseRepository:
                 self.session.add(new_loss)
         self.session.commit()
 
-    def save_incident(self, incident_data: dict) -> Incident:
-        new_incident = Incident(
-            plant_id=incident_data.get("plant_id"),
-            timestamp=self._coerce_datetime(incident_data.get("timestamp", datetime.utcnow())),
-            priority=incident_data.get("priority"),
-            diagnosis=incident_data.get("diagnosis"),
-            confidence=incident_data.get("confidence"),
-            status=incident_data.get("status", "New"),
-            notification_sent=incident_data.get("notification_sent", False),
-            ticket_id=incident_data.get("ticket_id")
+    # =========================================================================
+    # --- Gestion Explicable des Incidents (Milestone 3.5 & XAI) ---
+    # =========================================================================
+
+    def save_incident_report(self, report_data: Union[dict, Any]) -> Incident:
+        """
+        Enregistre un rapport d'incident complet et expliqué en base de données.
+        Accepte un dictionnaire, un objet IncidentDomain ou une instance d'IncidentReport.
+        """
+        if hasattr(report_data, "to_repository_dict"):
+            data = report_data.to_repository_dict()
+        elif hasattr(report_data, "to_dict"):
+            data = report_data.to_dict()
+        elif isinstance(report_data, dict):
+            data = report_data
+        else:
+            raise ValueError("save_incident_report: format de données non supporté.")
+
+        created_at = self._coerce_datetime(
+            data.get("created_at") or data.get("date") or datetime.utcnow()
         )
+
+        new_incident = Incident(
+            plant_id=data.get("plant_id", 1),
+            created_at=created_at,
+            incident_type=data.get("incident_type", "Anomaly"),
+            priority=data.get("priority", "MEDIUM"),
+            confidence=data.get("confidence", 0.0),
+            rule_score=data.get("rule_score"),
+            ai_score=data.get("ai_score"),
+            
+            # Champs XAI / Explicabilité
+            diagnosis=data.get("diagnosis"),
+            explanation=data.get("explanation"),
+            recommendation=data.get("recommendation"),
+            triggered_rules=data.get("triggered_rules"),
+            evidence=data.get("evidence"),
+            feature_snapshot=data.get("feature_snapshot"),
+            decision_trace=data.get("decision_trace"),
+            
+            # Suivi
+            status=data.get("status", "OPEN"),
+            notification_sent=data.get("notification_sent", False),
+            ticket_id=data.get("ticket_id")
+        )
+
         self.session.add(new_incident)
         self.session.commit()
         self.session.refresh(new_incident)
+        
+        logger.info(
+            f"Rapport d'Incident #{new_incident.id} enregistré pour la centrale {new_incident.plant_id} "
+            f"[Priorité: {new_incident.priority} | Diagnostic: {new_incident.diagnosis}]."
+        )
         return new_incident
 
-    def get_last_measure(self, plant_id: int) -> Optional[DailyMeasure]:
-        return self.session.query(DailyMeasure).filter_by(plant_id=plant_id).order_by(DailyMeasure.date.desc()).first()
+    def get_incident_report(self, incident_id: int) -> Optional[Incident]:
+        """Récupère un rapport d'incident complet par son identifiant unique."""
+        return self.session.query(Incident).filter_by(id=incident_id).first()
 
-    def get_active_incidents(self) -> List[Incident]:
-        return self.session.query(Incident).filter(Incident.status != "Resolved").all()
+    def update_incident_status(
+        self, 
+        incident_id: int, 
+        status: str, 
+        notes: Optional[str] = None
+    ) -> Optional[Incident]:
+        """
+        Met à jour le statut d'un incident (ex: OPEN, IN_PROGRESS, RESOLVED, CLOSED).
+        Ajuste automatiquement la date de résolution si l'incident est clos.
+        """
+        incident = self.session.query(Incident).filter_by(id=incident_id).first()
+        if not incident:
+            logger.warning(f"update_incident_status: Incident #{incident_id} introuvable.")
+            return None
+
+        clean_status = status.upper()
+        incident.status = clean_status
+
+        if clean_status in ["RESOLVED", "CLOSED"]:
+            incident.resolved_at = datetime.utcnow()
+
+        if notes:
+            # Traitement sécurisé selon que recommendation est un tableau JSON ou du texte
+            if isinstance(incident.recommendation, list):
+                updated_reco = list(incident.recommendation)
+                updated_reco.append(f"Note d'intervention : {notes}")
+                incident.recommendation = updated_reco
+            elif incident.recommended_action:
+                incident.recommended_action += f" | Note : {notes}"
+            else:
+                incident.recommended_action = f"Note : {notes}"
+
+        self.session.commit()
+        self.session.refresh(incident)
+        logger.info(f"Incident #{incident_id} mis à jour vers le statut [{incident.status}].")
+        return incident
+
+    def list_open_incidents(self, plant_id: Optional[int] = None) -> List[Incident]:
+        """Récupère tous les incidents en cours non résolus (OPEN, IN_PROGRESS, New)."""
+        query = self.session.query(Incident).filter(
+            Incident.status.in_(["OPEN", "IN_PROGRESS", "New"])
+        )
+        if plant_id is not None:
+            query = query.filter(Incident.plant_id == plant_id)
+
+        return query.order_by(Incident.created_at.desc()).all()
+
+    def list_closed_incidents(self, plant_id: Optional[int] = None) -> List[Incident]:
+        """Récupère tous les incidents archivés/résolus (RESOLVED, CLOSED)."""
+        query = self.session.query(Incident).filter(
+            Incident.status.in_(["RESOLVED", "CLOSED"])
+        )
+        if plant_id is not None:
+            query = query.filter(Incident.plant_id == plant_id)
+
+        return query.order_by(Incident.created_at.desc()).all()
+
+    # --- Alias de rétrocompatibilité (évite de casser l'existant) ---
+
+    def save_incident(self, incident_data: dict) -> Incident:
+        """Redirige vers save_incident_report pour compatibilité ascendante."""
+        return self.save_incident_report(incident_data)
+
+    def update_incident(self, incident_id: int, update_data: dict) -> Optional[Incident]:
+        """Met à jour un dictionnaire d'attributs arbitraires sur un incident."""
+        incident = self.session.query(Incident).filter_by(id=incident_id).first()
+        if not incident:
+            logger.warning(f"update_incident: Incident #{incident_id} introuvable.")
+            return None
+
+        for key, val in update_data.items():
+            if hasattr(incident, key):
+                if key in ["created_at", "resolved_at"]:
+                    val = self._coerce_datetime(val)
+                setattr(incident, key, val)
+
+        self.session.commit()
+        self.session.refresh(incident)
+        logger.info(f"Incident #{incident_id} mis à jour avec succès.")
+        return incident
+
+    def get_open_incidents(self, plant_id: Optional[int] = None) -> List[Incident]:
+        """Alias pour list_open_incidents."""
+        return self.list_open_incidents(plant_id=plant_id)
+
+    def close_incident(self, incident_id: int, resolution_notes: Optional[str] = None) -> Optional[Incident]:
+        """Alias spécialisé pour update_incident_status vers RESOLVED."""
+        return self.update_incident_status(incident_id, status="RESOLVED", notes=resolution_notes)
+
+    def get_incidents_by_plant(self, plant_id: int, status: Optional[str] = None) -> List[Incident]:
+        """Récupère l'historique des incidents d'une centrale, optionnellement filtré par statut."""
+        query = self.session.query(Incident).filter(Incident.plant_id == plant_id)
+        if status:
+            query = query.filter(Incident.status == status.upper())
+        return query.order_by(Incident.created_at.desc()).all()

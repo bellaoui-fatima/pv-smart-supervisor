@@ -5,7 +5,7 @@ DailyMeasure, Loss, Incident, Alert) et leurs liaisons.
 """
 
 from datetime import datetime
-from sqlalchemy import Column, String, Float, DateTime, ForeignKey, Integer, Boolean, Text
+from sqlalchemy import Column, String, Float, DateTime, ForeignKey, Integer, Boolean, Text, JSON
 from sqlalchemy.orm import relationship
 from app.database.database import Base
 
@@ -55,7 +55,7 @@ class DailyMeasure(Base):
     plant_id = Column(Integer, ForeignKey("plants.id"), nullable=False)
     date = Column(DateTime, nullable=False, index=True)
     
-    # --- Données Brutes (Raw Data issues de l'API) ---
+    # --- Données Brutes ---
     production = Column(Float, nullable=True)
     temperature = Column(Float, nullable=True)
     irradiation = Column(Float, nullable=True)
@@ -75,7 +75,7 @@ class DailyMeasure(Base):
     # --- Features Pertes ---
     loss_percentage = Column(Float, nullable=True, comment="Pourcentage de pertes déclarées")
 
-    # --- Features Équipements (Strings & Inverters) ---
+    # --- Features Équipements ---
     offline_inverters = Column(Integer, nullable=True, comment="Nombre d'onduleurs hors ligne")
     failed_strings = Column(Integer, nullable=True, comment="Nombre de chaînes (strings) défaillantes")
     communication_status = Column(Boolean, nullable=True, comment="État global de la communication de la centrale")
@@ -108,18 +108,34 @@ class Loss(Base):
 
 
 class Incident(Base):
-    """Modèle représentant un incident détecté sur une centrale."""
+    """Modèle ORM représentant un incident qualifié, expliqué et diagnostiqué."""
     __tablename__ = "incidents"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    plant_id = Column(Integer, ForeignKey("plants.id"), nullable=False)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow)
-    priority = Column(String(50), nullable=False)
-    diagnosis = Column(Text, nullable=True)
-    confidence = Column(Float, nullable=True)
-    status = Column(String(50), nullable=False, default="New")
+    plant_id = Column(Integer, ForeignKey("plants.id"), nullable=False, index=True)
+    
+    # --- Classification & Décision ---
+    incident_type = Column(String(100), nullable=True, comment="Catégorie générale (Ex: Anomaly, Comm Loss)")
+    rule_score = Column(Float, nullable=True, comment="Score cumulé issu du Rules Engine")
+    ai_score = Column(Float, nullable=True, comment="Score prédictif du modèle ML (Réservé Milestone 4)")
+    confidence = Column(Float, nullable=True, comment="Niveau de confiance final (0.0 à 1.0)")
+    priority = Column(String(50), nullable=False, default="MEDIUM", comment="CRITICAL, HIGH, MEDIUM, LOW")
+    
+    # --- Explicabilité & XAI  ---
+    diagnosis = Column(String(255), nullable=True, comment="Diagnostic technique précis (ex: offline_inverter)")
+    explanation = Column(Text, nullable=True, comment="Explication en langage naturel pour l'opérateur")
+    recommendation = Column(JSON, nullable=True, comment="Liste des actions recommandées (SOP)")
+    triggered_rules = Column(JSON, nullable=True, comment="Liste des règles métier déclenchées")
+    evidence = Column(JSON, nullable=True, comment="Variables clés ayant mené à la décision (ex: PR=0.61)")
+    feature_snapshot = Column(JSON, nullable=True, comment="Vecteur de features complet au moment T (Pour audit)")
+    decision_trace = Column(JSON, nullable=True, comment="Trace détaillée du parcours de décision (Rules + XAI)")
+
+    # --- Suivi de Cycle de Vie ---
+    status = Column(String(50), nullable=False, default="OPEN", index=True, comment="OPEN, IN_PROGRESS, RESOLVED")
     notification_sent = Column(Boolean, nullable=False, default=False)
     ticket_id = Column(String(100), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    resolved_at = Column(DateTime, nullable=True)
 
     # Relations
     plant = relationship("Plant", back_populates="incidents")

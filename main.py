@@ -1,8 +1,8 @@
 """
-Module principal d'orchestration du Milestone 2 (main.py).
+Module principal d'orchestration du Milestone 2, 3 & 3.5 (main.py).
 Exécute le pipeline séquentiel complet :
-Collecte -> Preprocessing -> Expected Production -> String Analysis -> 
-Feature Engineering -> Feature Store (Persistance SQLAlchemy).
+Collecte -> Preprocessing -> Feature Engineering -> Feature Store -> 
+Decision Engine (Détection, Explicabilité, Recommandations) -> Persistance du Rapport.
 """
 
 import pandas as pd
@@ -17,12 +17,15 @@ from app.database.models import Plant
 from app.collectors.rawametrix import RawametrixClient
 from app.collectors.energysoft import EnergysoftClient
 
-# Modules de traitement du Milestone 2
+# Modules de traitement (Milestone 2)
 from app.processing.preprocessing import DataPreprocessor
 from app.processing.expected_production import ExpectedProductionCalculator
 from app.processing.strings_analysis import StringAnalyzer
 from app.processing.feature_engineering import FeatureEngineer
 from app.processing.feature_store import FeatureStore
+
+# Modules de Décision et XAI (Milestone 3 & 3.5)
+from app.detection.decision_engine import DecisionEngine
 
 
 def _ensure_daily_measure_columns() -> None:
@@ -33,15 +36,9 @@ def _ensure_daily_measure_columns() -> None:
         }
 
         required_columns = {
-            "performance_ratio",
-            "temperature_gap",
-            "irradiation_ratio",
-            "loss_percentage",
-            "offline_inverters",
-            "failed_strings",
-            "communication_status",
-            "rolling_mean_7d",
-            "rolling_std_7d",
+            "performance_ratio", "temperature_gap", "irradiation_ratio",
+            "loss_percentage", "offline_inverters", "failed_strings",
+            "communication_status", "rolling_mean_7d", "rolling_std_7d",
             "anomaly_score_rule",
         }
 
@@ -51,14 +48,12 @@ def _ensure_daily_measure_columns() -> None:
 
 
 def run_pipeline() -> None:
-    """Exécute l'ensemble du pipeline de Feature Engineering et de stockage."""
-    logger.info("=== DÉMARRAGE DU PIPELINE DE FEATURE ENGINEERING (MILESTONE 2) ===")
+    """Exécute l'ensemble du pipeline de bout-en-bout (Collecte jusqu'au Rapport d'Incident explicable)."""
+    logger.info("=== DÉMARRAGE DU PIPELINE COMPLET (MILESTONES 2, 3 & 3.5) ===")
 
     # 1. Initialisation / Vérification de la base de données
     logger.info("Vérification des tables de la base de données...")
     try:
-        # Remarque : En production, privilégier Alembic pour les migrations.
-        # Base.metadata.drop_all(bind=engine) # Décommenter en dev si besoin de reset complet
         Base.metadata.create_all(bind=engine)
         _ensure_daily_measure_columns()
         logger.info("Tables vérifiées/créées avec succès.")
@@ -66,16 +61,19 @@ def run_pipeline() -> None:
         logger.error(f"Erreur lors de la préparation des tables : {exc}")
         return
 
-    # 2. Initialisation des clients d'API
-    logger.info("Initialisation des clients API...")
+    # 2. Initialisation des clients API
     rawa_client = RawametrixClient()
     es_client = EnergysoftClient()
 
-    # 3. Initialisation des modules de traitement
+    # 3. Initialisation des modules de traitement et décision
     preprocessor = DataPreprocessor()
     prod_calculator = ExpectedProductionCalculator()
     string_analyzer = StringAnalyzer()
     feature_engineer = FeatureEngineer()
+    
+    # Le DecisionEngine agit désormais comme un "Super Orchestrateur" de détection
+    # Il inclut en interne le RuleEngine, l'ExplanationEngine et le RecommendationEngine
+    decision_engine = DecisionEngine()
 
     # 4. Ouverture de la session BDD, du Repository et du FeatureStore
     db_session = next(get_db_session())
@@ -104,7 +102,7 @@ def run_pipeline() -> None:
 
             try:
                 # --- A. Collecte des données brutes ---
-                logger.info("1/6. Collecte des données brutes API...")
+                logger.info("1/7. Collecte des données brutes API...")
                 df_measures = rawa_client.get_day_measures(plant_id=plant.rawametrix_id)
                 df_losses = rawa_client.get_losses(plant_id=plant.rawametrix_id)
 
@@ -114,15 +112,13 @@ def run_pipeline() -> None:
                     logger.warning(f"Onduleurs Energysoft indisponibles pour {plant.name} : {exc}")
                     df_inverters = pd.DataFrame()
 
-                # Tentative de récupération des mesures de strings (si supporté par le client)
                 try:
                     df_strings = rawa_client.get_string_measures(plant_id=plant.rawametrix_id)
                 except AttributeError:
-                    # Si l'API ou la méthode dédiée n'existe pas encore
                     df_strings = pd.DataFrame()
 
                 # --- B. Preprocessing ---
-                logger.info("2/6. Nettoyage et validation des données (Preprocessing)...")
+                logger.info("2/7. Nettoyage et validation des données (Preprocessing)...")
                 df_clean_measures = preprocessor.process_daily_measures(df_measures)
 
                 if df_clean_measures.empty:
@@ -130,15 +126,15 @@ def run_pipeline() -> None:
                     continue
 
                 # --- C. Expected Production ---
-                logger.info("3/6. Calcul de la production attendue, delta et PR...")
+                logger.info("3/7. Calcul de la production attendue, delta et PR...")
                 df_expected_measures = prod_calculator.process(df_clean_measures)
 
                 # --- D. String Analysis ---
-                logger.info("4/6. Analyse du parc de chaînes (Strings)...")
+                logger.info("4/7. Analyse du parc de chaînes (Strings)...")
                 string_results = string_analyzer.analyze(df_strings)
 
                 # --- E. Feature Engineering ---
-                logger.info("5/6. Construction de la matrice de Features pour l'IA...")
+                logger.info("5/7. Construction de la matrice de Features pour l'IA...")
                 df_features = feature_engineer.create_features(
                     df_measures=df_expected_measures,
                     inverters_data=df_inverters,
@@ -147,16 +143,31 @@ def run_pipeline() -> None:
                 )
 
                 # --- F. Persistance via Feature Store & Repository ---
-                logger.info("6/6. Persistance des features et entités dans la base de données...")
-                
-                # Sauvegarde des objets bruts complémentaires
+                logger.info("6/7. Persistance des features et entités dans la base de données...")
                 if not df_losses.empty:
                     repo.save_losses(plant_id=plant.id, losses_data=df_losses.to_dict(orient="records"))
                 if not df_inverters.empty:
                     repo.save_inverters(plant_id=plant.id, inverters_data=df_inverters.to_dict(orient="records"))
 
-                # Sauvegarde des features enrichies via le FeatureStore
                 feature_store.save_features(plant_id=plant.id, df_features=df_features)
+
+                # --- G. Décision et Création de Rapports d'Incidents (Milestone 3.5 - XAI) ---
+                logger.info("7/7. Évaluation par le Decision Engine (Détection, Explicabilité, Recommandation)...")
+                
+                # Utilisation de la nouvelle méthode standardisée du FeatureStore
+                latest_features = feature_store.get_last_features(plant_id=plant.id)
+
+                if latest_features:
+                    # Le Decision Engine gère désormais toute la chaîne de bout en bout (y compris XAI)
+                    # et retourne un IncidentReport complet (ou None si RAS)
+                    incident_report = decision_engine.evaluate(plant_id=plant.id, features=latest_features)
+                    
+                    if incident_report:
+                        logger.info(f"Anomalie détectée ! Enregistrement du rapport d'incident complet...")
+                        # Utilisation de la nouvelle méthode du Repository adaptée pour le Milestone 3.5
+                        repo.save_incident_report(incident_report)
+                else:
+                    logger.warning(f"Impossible de récupérer les dernières features pour la centrale {plant.name}.")
 
                 logger.info(f"Traitement réussi pour la centrale : {plant.name}")
 
@@ -164,7 +175,7 @@ def run_pipeline() -> None:
                 logger.error(f"Échec du traitement pour la centrale {plant.name} : {exc}", exc_info=True)
                 continue
 
-        logger.info("=== PIPELINE DU MILESTONE 2 TERMINÉ AVEC SUCCÈS ===")
+        logger.info("=== PIPELINE DU MILESTONE 3.5 TERMINÉ AVEC SUCCÈS ===")
 
     except Exception as e:
         logger.critical(f"Erreur critique lors de l'exécution du pipeline : {e}", exc_info=True)
